@@ -17,7 +17,7 @@ import sys
 
 
 def find_driver() -> str:
-    """Find CuaDriver without depending on a particular user's install path."""
+    """Busca Cua Driver sin depender de una ruta de instalación personal."""
     configured = os.environ.get("CU_DRIVER")
     if configured:
         return os.path.expanduser(configured)

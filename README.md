@@ -28,7 +28,7 @@ Inicia el daemon:
 ./start-daemon.sh
 ```
 
-El socket predeterminado es `~/Library/Caches/cu-mini/cu.sock`. Para usar otra ubicación:
+El socket predeterminado es `~/Library/Caches/cu-mini/cu.sock` en macOS y `${XDG_CACHE_HOME:-~/.cache}/cu-mini/cu.sock` en Linux. Para usar otra ubicación:
 
 ```bash
 CU_SOCKET="$HOME/.cache/cu-mini/cu.sock" ./start-daemon.sh
@@ -57,7 +57,7 @@ Agrega el servidor a la configuración de cualquier cliente compatible con MCP s
 }
 ```
 
-El puente busca `cua-driver` en `PATH` y en las ubicaciones habituales de CuaDriver.app. Si no lo encuentra automáticamente, configura `CU_DRIVER` en el entorno del cliente MCP con la ruta al ejecutable. Si cambiaste el socket predeterminado, define también `CU_SOCKET` con la misma ruta que usaste al arrancar el daemon. En Windows, inicia Cua Driver desde su terminal y configura explícitamente un endpoint compatible con esa plataforma.
+El puente busca `cua-driver` en `PATH` y en las ubicaciones habituales de CuaDriver.app. Si no lo encuentra automáticamente, configura `CU_DRIVER` en el entorno del cliente MCP con la ruta al ejecutable. Si cambiaste el socket predeterminado, define también `CU_SOCKET` con la misma ruta que usaste al arrancar el daemon. El script de arranque incluido está preparado para macOS y Linux; Windows requiere adaptar el arranque y el endpoint.
 
 ## Herramientas
 
@@ -76,13 +76,13 @@ El puente busca `cua-driver` en `PATH` y en las ubicaciones habituales de CuaDri
 
 ## Permisos y modo de ejecución
 
-El daemon arranca con los controles de permisos de CuaDriver habilitados. Para sesiones desechables y bajo tu responsabilidad, puedes desactivar esos controles explícitamente:
+El daemon arranca en modo `standard`. Para sesiones desechables y bajo tu responsabilidad, puedes elegir el modo irrestricto explícitamente:
 
 ```bash
 CUA_UNSAFE_MODE=1 ./start-daemon.sh
 ```
 
-Ese modo usa `--dangerously-bypass-approvals`, que activa el modo unrestricted de Cua Driver. Las herramientas podrán actuar en las apps disponibles en el escritorio sin pedir aprobación. Usa una cuenta y sesión de escritorio adecuadas para ese nivel de acceso.
+Ese modo usa `--dangerously-bypass-approvals`, que activa el modo unrestricted de Cua Driver y omite las aprobaciones del agente. macOS aún requiere que Cua Driver tenga sus permisos de Accesibilidad y Grabación de pantalla. Usa una cuenta y sesión de escritorio adecuadas para ese nivel de acceso.
 
 `open_app` solo acepta nombres de aplicaciones, no rutas ni argumentos. El puente no expone las herramientas `kill_app`, `run_script` ni `clipboard_*` del driver.
 
