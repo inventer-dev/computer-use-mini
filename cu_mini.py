@@ -11,9 +11,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 
 def find_driver() -> str:
@@ -112,6 +115,11 @@ TOOLS = [
             "x": {"type": "integer"},
             "y": {"type": "integer"},
             "count": {"type": "integer", "description": "1 (default) o 2 para doble click"},
+            "capture_id": {"type": "string",
+                           "description": "ID de captura que devuelve `screen` (structuredContent.capture_id). "
+                                          "Úsalo con x,y para clics por píxel."},
+            "delivery_mode": {"type": "string", "enum": ["background", "foreground"]},
+            "button": {"type": "string", "enum": ["left", "right", "middle"]},
         },
         ["window_id"],
     ),
@@ -151,9 +159,32 @@ TOOLS = [
     ),
     tool(
         "open_app",
-        "Abre (o trae al frente) una app por nombre, p.ej. 'TextEdit'.",
+        "Abre (o activa) una app por nombre, p.ej. 'TextEdit'. No garantiza que su ventana quede al frente.",
         {"name": {"type": "string"}},
         ["name"],
+    ),
+    tool(
+        "front",
+        "Trae al frente una ventana concreta y la deja enfocada. Úsalo cuando el juego o la app "
+        "esté detrás de otra ventana o en otro monitor.",
+        {"window_id": WINDOW_ID},
+        ["window_id"],
+    ),
+    tool(
+        "displays",
+        "Lista los monitores activos con sus límites, escala y cuál es el principal.",
+        {},
+        [],
+    ),
+    tool(
+        "screenshot",
+        "Captura una pantalla completa a un PNG (por defecto la principal). Devuelve ruta y tamaño. "
+        "Usa `display` para elegir monitor.",
+        {
+            "display": {"type": "integer", "description": "Índice de pantalla (1 = principal)."},
+            "path": {"type": "string", "description": "Ruta de salida del PNG."},
+        },
+        [],
     ),
     tool(
         "guide",
@@ -167,27 +198,148 @@ TOOLS = [
 ROUTES = {
     "windows": ("list_windows", {"app", "all_spaces"}),
     "screen": ("get_window_state", {"window_id", "since", "max_elements", "image"}),
-    "click": ("click", {"window_id", "element", "x", "y", "count"}),
+    "click": ("click", {"window_id", "element", "x", "y", "count", "capture_id", "delivery_mode", "button"}),
     "type": ("type_text", {"window_id", "text", "element"}),
     "key": ("press_key", {"window_id", "key", "modifiers"}),
     "scroll": ("scroll", {"window_id", "direction", "amount"}),
     "open_app": ("launch_app", {"name"}),
+    "front": ("bring_to_front", {"window_id", "session"}),
     "guide": ("get_guide", {"topic"}),
 }
 
+_JXA_SCREENS = """
+ObjC.import("AppKit");
+var arr = $.NSScreen.screens, n = arr.count, out = [];
+var m = $.NSScreen.mainScreen.frame;
+for (var i = 0; i < n; i++) {
+  var s = arr.objectAtIndex(i), f = s.frame;
+  var isMain = (f.origin.x == m.origin.x && f.origin.y == m.origin.y &&
+                f.size.width == m.size.width && f.size.height == m.size.height);
+  out.push({index:i, x:f.origin.x, y:f.origin.y, w:f.size.width, h:f.size.height,
+            scale:s.backingScaleFactor, main:isMain});
+}
+JSON.stringify({main_w:m.size.width, main_h:m.size.height, screens:out});
+"""
+
+_SCREENS_CACHE = {"t": 0.0, "v": None}
+
+
+def screens():
+    """Pantallas activas vía NSScreen (JXA). Cache de 5 s."""
+    now = time.time()
+    if _SCREENS_CACHE["v"] and now - _SCREENS_CACHE["t"] < 5:
+        return _SCREENS_CACHE["v"]
+    out = subprocess.run(["osascript", "-l", "JavaScript", "-e", _JXA_SCREENS],
+                         capture_output=True, text=True, timeout=10).stdout.strip()
+    data = json.loads(out) if out else {"screens": [], "main_h": 0}
+    _SCREENS_CACHE.update({"t": now, "v": data})
+    return data
+
+
+def display_of(bounds):
+    """Índice de pantalla (1-based) que contiene el centro de la ventana, o 0."""
+    try:
+        d = screens()
+        main_h = float(d.get("main_h") or 0)
+        cx = float(bounds.get("x", 0)) + float(bounds.get("width", 0)) / 2
+        cy = float(bounds.get("y", 0)) + float(bounds.get("height", 0)) / 2
+        for s in d.get("screens", []):
+            # NSScreen: origen abajo-izquierda; CGWindow: arriba-izquierda.
+            top = main_h - (float(s["y"]) + float(s["h"]))
+            if float(s["x"]) <= cx <= float(s["x"]) + float(s["w"]) and top <= cy <= top + float(s["h"]):
+                return int(s["index"]) + 1
+    except Exception:
+        pass
+    return 0
+
+
+class _DriverSession:
+    """Sesión MCP persistente contra `cua-driver mcp`."""
+
+    def __init__(self):
+        cmd = [CUA, "mcp"]
+        if SOCKET:
+            cmd += ["--socket", SOCKET]
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+        self._id = 0
+        self.request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "computer-use-mini", "version": "0.2.0"},
+        })
+        self.notify("notifications/initialized")
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def notify(self, method: str, params: dict | None = None) -> None:
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def request(self, method: str, params: dict | None = None, timeout: float | None = None) -> dict:
+        self._id += 1
+        mid = self._id
+        msg = {"jsonrpc": "2.0", "id": mid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + (timeout if timeout is not None else TIMEOUT)
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                raise RuntimeError(f"{method}: timeout")
+            ready, _, _ = select.select([self.proc.stdout], [], [], left)
+            if not ready:
+                raise RuntimeError(f"{method}: timeout")
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError(f"{method}: el driver cerró la sesión")
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if resp.get("id") == mid:
+                return resp
+
+
+_DRIVER: "_DriverSession | None" = None
+
+
+def _session() -> "_DriverSession":
+    global _DRIVER
+    if _DRIVER is None or not _DRIVER.alive():
+        _DRIVER = _DriverSession()
+    return _DRIVER
+
 
 def cua_call(driver_tool: str, args: dict) -> dict:
-    cmd = [CUA, "call", "--socket", SOCKET, driver_tool, json.dumps(args)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-    out = (proc.stdout or "").strip()
+    """Llama una tool del driver dentro de una sesión MCP persistente.
+
+    Importante: `cua-driver call` crea una sesión nueva por invocación, así que los
+    `capture_id` y `element_token` mueren entre llamadas. Mantener un `cua-driver mcp`
+    vivo permite snapshot -> click sobre la misma sesión.
+    """
+    res = _session().request("tools/call", {"name": driver_tool, "arguments": args})
+    if "error" in res:
+        raise RuntimeError((res["error"] or {}).get("message", "driver error"))
+    result = res.get("result") or {}
+    out = dict(result.get("structuredContent") or {})
+    for block in result.get("content") or []:
+        if block.get("type") == "image" and block.get("data"):
+            out["screenshot_png_b64"] = block["data"]
+            out.setdefault("screenshot_mime_type", block.get("mimeType", "image/png"))
     if not out:
-        raise RuntimeError(
-            f"{driver_tool}: sin salida (rc={proc.returncode}) {proc.stderr.strip()[:400]}"
-        )
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return {"text": out}
+        out = {"text": "".join(b.get("text", "") for b in result.get("content") or [])}
+    if result.get("isError"):
+        out["isError"] = True
+    return out
 
 
 _PID_CACHE: dict[int, int] = {}
@@ -215,6 +367,7 @@ def as_content(public: str, result: dict) -> dict:
         return {"content": [{"type": "text", "text": f"ERROR: {msg}"}], "isError": True}
 
     blocks: list[dict] = []
+    rows: list[dict] = []
     tree = result.get("tree_markdown")
     if tree:
         header = f"snapshot_id: {result.get('snapshot_id')} | window_id: {result.get('window_id')}"
@@ -222,16 +375,23 @@ def as_content(public: str, result: dict) -> dict:
         if result.get("truncated"):
             blocks.append({"type": "text", "text": result.get("truncation_hint", "")})
     elif public == "windows":
-        rows = [
-            {
+        rows = []
+        for w in (result.get("windows") or []):
+            if w.get("layer") != 0:
+                continue
+            b = w.get("bounds") or {}
+            if not b.get("width") or not b.get("height"):
+                continue
+            rows.append({
                 "window_id": w.get("window_id"),
                 "pid": w.get("pid"),
                 "app": w.get("app_name"),
                 "title": w.get("title"),
-            }
-            for w in (result.get("windows") or [])
-            if w.get("is_on_screen") and w.get("layer") == 0
-        ]
+                "on_screen": bool(w.get("is_on_screen")),
+                "display": display_of(b),
+                "z": w.get("z_index"),
+            })
+        rows.sort(key=lambda r: (r.get("z") is None, r.get("z") or 0))
         blocks.append({"type": "text", "text": json.dumps(rows, ensure_ascii=False)})
     else:
         slim = {
@@ -250,11 +410,57 @@ def as_content(public: str, result: dict) -> dict:
                 "mimeType": result.get("screenshot_mime_type", "image/png"),
             }
         )
-    return {"content": blocks, "structuredContent": {"snapshot_id": result.get("snapshot_id"),
-                                                    "window_id": result.get("window_id")}}
+    structured = {"snapshot_id": result.get("snapshot_id"),
+                  "window_id": result.get("window_id"),
+                  "capture_id": result.get("capture_id")}
+    # Algunos clientes (opencode) solo exponen structuredContent al modelo.
+    # Incluir el payload real evita que la llamada se vea vacía.
+    if public == "windows":
+        structured["windows"] = rows
+    elif tree:
+        structured["tree"] = tree[:20000]
+        structured["truncated"] = bool(result.get("truncated"))
+    else:
+        structured["result"] = {k: v for k, v in result.items()
+                                if k != "screenshot_png_b64" and
+                                (not isinstance(v, str) or len(v) < 4000)}
+    return {"content": blocks, "structuredContent": structured}
+
+
+def png_size(path: str):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+        if head[:8] != b"\x89PNG\r\n\x1a\n":
+            return (0, 0)
+        return (int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big"))
+    except Exception:
+        return (0, 0)
 
 
 def call_tool(name: str, args: dict) -> dict:
+    if name == "displays":
+        rows = [{"display": s["index"] + 1, "main": bool(s.get("main")),
+                 "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "scale": s["scale"]}
+                for s in screens().get("screens", [])]
+        return {"content": [{"type": "text", "text": json.dumps(rows)}],
+                "structuredContent": {"displays": rows}}
+
+    if name == "screenshot":
+        disp = int((args or {}).get("display") or 1)
+        path = (args or {}).get("path") or os.path.join(
+            tempfile.gettempdir(), "cu-screen-%d.png" % disp)
+        proc = subprocess.run(["screencapture", "-x", "-D", str(disp), path],
+                              capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(path):
+            return {"content": [{"type": "text", "text":
+                                 "ERROR: screencapture falló: %s" % (proc.stderr or "")[:200]}],
+                    "isError": True}
+        w, h = png_size(path)
+        info = {"path": path, "display": disp, "width": w, "height": h}
+        return {"content": [{"type": "text", "text": json.dumps(info)}],
+                "structuredContent": info}
+
     route = ROUTES.get(name)
     if route is None:
         return {"content": [{"type": "text", "text": f"ERROR: tool desconocido {name}"}],
@@ -272,8 +478,9 @@ def call_tool(name: str, args: dict) -> dict:
         else:
             payload.pop("since", None)
     if name == "windows":
-        if not payload.pop("all_spaces", False):
-            payload["on_screen_only"] = True
+        # No filtrar en el driver: con pantallas duplicadas/extendidas `is_on_screen`
+        # puede venir siempre en false. Devolvemos todas las layer 0 y marcamos el estado.
+        payload.pop("all_spaces", None)
     if name in ("click", "type") and payload.get("element"):
         if not TOKEN_RE.match(str(payload["element"])):
             return {
@@ -292,7 +499,7 @@ def call_tool(name: str, args: dict) -> dict:
                                  "ERROR: nombre de app invalido"}], "isError": True}
 
     if "window_id" in payload and driver_tool in (
-        "get_window_state", "click", "type_text", "press_key", "scroll"
+        "get_window_state", "click", "type_text", "press_key", "scroll", "bring_to_front"
     ) and not payload.get("pid"):
         pid = resolve_pid(int(payload["window_id"]))
         if pid is None:
@@ -300,6 +507,10 @@ def call_tool(name: str, args: dict) -> dict:
                                  f"ERROR: no encuentro pid para window_id {payload['window_id']}"}],
                     "isError": True}
         payload["pid"] = pid
+
+    # El driver 0.52 espera `element_token`; la API pública usa `element`.
+    if payload.get("element"):
+        payload["element_token"] = payload.pop("element")
 
     try:
         result = cua_call(driver_tool, payload)
