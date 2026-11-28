@@ -160,7 +160,7 @@ TOOLS = [
     tool(
         "drag",
         "Arrastre con presionar-mover-soltar entre dos puntos de la captura de la ventana. "
-        "Sirve para swipe (feed tipo TikTok), seleccionar texto, mover sliders o paneles.",
+        "Para swipe (feed tipo TikTok) usa `swipe`: es más simple y rápido.",
         {
             "window_id": WINDOW_ID,
             "from_x": {"type": "number"},
@@ -173,6 +173,20 @@ TOOLS = [
             "button": {"type": "string", "enum": ["left", "right", "middle"]},
         },
         ["window_id", "from_x", "from_y", "to_x", "to_y"],
+    ),
+    tool(
+        "swipe",
+        "Swipe vertical u horizontal en el centro de la ventana. Pensado para feeds (TikTok, "
+        "Reels) y apps que reenvían el gesto al teléfono (iPhone Mirroring): usa foreground y un "
+        "gesto rápido por defecto.",
+        {
+            "window_id": WINDOW_ID,
+            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+            "duration_ms": {"type": "integer", "description": "Duración del gesto (default 120)"},
+            "distance": {"type": "number", "description": "Fracción de la ventana a recorrer (0-1, default 0.5)"},
+            "delivery_mode": {"type": "string", "enum": ["background", "foreground"]},
+        },
+        ["window_id", "direction"],
     ),
     tool(
         "open_app",
@@ -200,6 +214,9 @@ TOOLS = [
         {
             "display": {"type": "integer", "description": "Índice de pantalla (1 = principal)."},
             "path": {"type": "string", "description": "Ruta de salida del PNG."},
+            "window_id": {"type": "integer",
+                          "description": "Captura solo esa ventana recortando la pantalla. "
+                                         "Úsalo para iPhone Mirroring, que no se deja capturar directo."},
         },
         [],
     ),
@@ -466,19 +483,101 @@ def call_tool(name: str, args: dict) -> dict:
                 "structuredContent": {"displays": rows}}
 
     if name == "screenshot":
-        disp = int((args or {}).get("display") or 1)
-        path = (args or {}).get("path") or os.path.join(
-            tempfile.gettempdir(), "cu-screen-%d.png" % disp)
-        proc = subprocess.run(["screencapture", "-x", "-D", str(disp), path],
-                              capture_output=True, text=True)
-        if proc.returncode != 0 or not os.path.exists(path):
-            return {"content": [{"type": "text", "text":
-                                 "ERROR: screencapture falló: %s" % (proc.stderr or "")[:200]}],
-                    "isError": True}
+        disp = int((args or {}).get("display") or 0)
+        wid = (args or {}).get("window_id")
+        path = (args or {}).get("path")
+        if wid:
+            # Captura por región: sirve para ventanas que no se dejan capturar
+            # directo (iPhone Mirroring devuelve una composición con otras ventanas).
+            pid = resolve_pid(int(wid))
+            raw = cua_call("list_windows", {})
+            win = next((w for w in (raw.get("windows") or [])
+                        if w.get("window_id") == int(wid)), None)
+            if not win:
+                return {"content": [{"type": "text", "text": "ERROR: ventana no encontrada"}],
+                        "isError": True}
+            b = win.get("bounds") or {}
+            d = screens().get("screens", [])
+            cx = float(b.get("x", 0)) + float(b.get("width", 0)) / 2
+            cy = float(b.get("y", 0)) + float(b.get("height", 0)) / 2
+            target = None
+            for s in d:
+                top = float(screens().get("main_h") or 0) - (float(s["y"]) + float(s["h"]))
+                if float(s["x"]) <= cx <= float(s["x"]) + float(s["w"]) and top <= cy <= top + float(s["h"]):
+                    target = s
+                    break
+            if target is None:
+                target = d[0] if d else {"index": 0, "x": 0, "y": 0, "w": 1920, "h": 1080}
+            disp = int(target["index"]) + 1
+            path = path or os.path.join(tempfile.gettempdir(), "cu-win-%s.png" % wid)
+            proc = subprocess.run(["screencapture", "-x", "-D", str(disp), path],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0 or not os.path.exists(path):
+                return {"content": [{"type": "text", "text": "ERROR: screencapture falló"}],
+                        "isError": True}
+            try:
+                from PIL import Image
+                im = Image.open(path)
+                scale = im.width / float(target["w"]) if target.get("w") else 1.0
+                top = float(screens().get("main_h") or 0) - (float(target["y"]) + float(target["h"]))
+                left = (float(b.get("x", 0)) - float(target["x"])) * scale
+                upper = (float(b.get("y", 0)) - top) * scale
+                right = left + float(b.get("width", 0)) * scale
+                lower = upper + float(b.get("height", 0)) * scale
+                im.crop((int(left), int(upper), int(right), int(lower))).save(path)
+            except Exception as exc:  # noqa: BLE001
+                return {"content": [{"type": "text", "text": "ERROR recortando: %s" % exc}],
+                        "isError": True}
+        else:
+            disp = disp or 1
+            path = path or os.path.join(tempfile.gettempdir(), "cu-screen-%d.png" % disp)
+            proc = subprocess.run(["screencapture", "-x", "-D", str(disp), path],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0 or not os.path.exists(path):
+                return {"content": [{"type": "text", "text":
+                                     "ERROR: screencapture falló: %s" % (proc.stderr or "")[:200]}],
+                        "isError": True}
         w, h = png_size(path)
-        info = {"path": path, "display": disp, "width": w, "height": h}
+        info = {"path": path, "display": disp, "width": w, "height": h,
+                "window_id": wid or None}
         return {"content": [{"type": "text", "text": json.dumps(info)}],
                 "structuredContent": info}
+
+    if name == "swipe":
+        wid = int((args or {}).get("window_id"))
+        direction = (args or {}).get("direction") or "up"
+        dur = int((args or {}).get("duration_ms") or 120)
+        dist = float((args or {}).get("distance") or 0.5)
+        dm = (args or {}).get("delivery_mode") or "foreground"
+        pid = resolve_pid(wid)
+        if pid is None:
+            return {"content": [{"type": "text", "text":
+                                 "ERROR: no encuentro pid para window_id %s" % wid}], "isError": True}
+        state = cua_call("get_window_state", {"pid": pid, "window_id": wid,
+                                              "include_screenshot": True, "tree_format": "markdown"})
+        w = state.get("screenshot_width") or 400
+        h = state.get("screenshot_height") or 800
+        cx, cy = w / 2.0, h / 2.0
+        span = max(40.0, dist * min(w, h))
+        if direction == "up":
+            frm, to = (cx, cy + span / 2), (cx, cy - span / 2)
+        elif direction == "down":
+            frm, to = (cx, cy - span / 2), (cx, cy + span / 2)
+        elif direction == "left":
+            frm, to = (cx + span / 2, cy), (cx - span / 2, cy)
+        else:
+            frm, to = (cx - span / 2, cy), (cx + span / 2, cy)
+        res = cua_call("drag", {"pid": pid, "window_id": wid,
+                                "from_x": frm[0], "from_y": frm[1],
+                                "to_x": to[0], "to_y": to[1],
+                                "duration_ms": dur, "steps": max(4, dur // 20),
+                                "delivery_mode": dm})
+        out = as_content(name, res)
+        out.setdefault("structuredContent", {})["gesture"] = {
+            "from": [round(frm[0], 1), round(frm[1], 1)],
+            "to": [round(to[0], 1), round(to[1], 1)],
+            "duration_ms": dur, "delivery_mode": dm}
+        return out
 
     route = ROUTES.get(name)
     if route is None:
