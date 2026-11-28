@@ -158,6 +158,19 @@ TOOLS = [
         ["window_id", "direction"],
     ),
     tool(
+        "scroll_smooth",
+        "Scroll con fases de trackpad (el gesto de dos dedos). Es el que sí funciona en "
+        "iPhone Mirroring y feeds tipo TikTok; `scroll` manda rueda discreta y casi nunca avanza.",
+        {
+            "window_id": WINDOW_ID,
+            "direction": {"type": "string", "enum": ["up", "down", "left", "right"],
+                          "description": "down = avanzar al siguiente elemento del feed"},
+            "amount": {"type": "integer", "description": "Píxeles totales (default 400)"},
+            "steps": {"type": "integer", "description": "Eventos intermedios (default 14)"},
+        },
+        ["window_id", "direction"],
+    ),
+    tool(
         "drag",
         "Arrastre con presionar-mover-soltar entre dos puntos de la captura de la ventana. "
         "Para swipe (feed tipo TikTok) usa `swipe`: es más simple y rápido.",
@@ -474,6 +487,66 @@ def png_size(path: str):
         return (0, 0)
 
 
+_CG = None
+
+
+def _coregraphics():
+    """Carga CoreGraphics por ctypes (sin dependencias) y fija firmas."""
+    global _CG
+    if _CG is not None:
+        return _CG
+    import ctypes
+    import ctypes.util
+    cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+    cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+    cg.CGEventCreateScrollWheelEvent2.restype = ctypes.c_void_p
+    cg.CGEventCreateScrollWheelEvent2.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                                  ctypes.c_uint32, ctypes.c_int32,
+                                                  ctypes.c_int32, ctypes.c_int32]
+    cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64]
+    cg.CGEventPostToPid.argtypes = [ctypes.c_int32, ctypes.c_void_p]
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    _CG = (cg, cf)
+    return _CG
+
+
+def smooth_scroll(pid, dy, dx=0, steps=14, ms=12):
+    """Scroll con fases de trackpad (began/changed/ended) + inercia, dirigido al pid.
+
+    Es lo que sí interpreta iPhone Mirroring; la rueda discreta casi nunca.
+    """
+    import time as _t
+    cg, cf = _coregraphics()
+    IS_CONTINUOUS, SCROLL_PHASE, MOMENTUM_PHASE = 88, 99, 123
+    BEGAN, CHANGED, ENDED, M_END = 1, 2, 4, 4
+
+    def make(y, x, phase=0, momentum=0):
+        ev = cg.CGEventCreateScrollWheelEvent2(None, 0, 2, int(y), int(x), 0)
+        cg.CGEventSetIntegerValueField(ev, IS_CONTINUOUS, 1)
+        if phase:
+            cg.CGEventSetIntegerValueField(ev, SCROLL_PHASE, phase)
+        if momentum:
+            cg.CGEventSetIntegerValueField(ev, MOMENTUM_PHASE, momentum)
+        return ev
+
+    def post(ev):
+        cg.CGEventPostToPid(pid, ev)
+        cf.CFRelease(ev)
+
+    post(make(0, 0, phase=BEGAN))
+    _t.sleep(ms / 1000.0)
+    sy, sx = dy / float(steps), dx / float(steps)
+    for _ in range(steps):
+        post(make(sy, sx, phase=CHANGED))
+        _t.sleep(ms / 1000.0)
+    post(make(0, 0, phase=ENDED))
+    _t.sleep(0.02)
+    for frac in (0.45, 0.30, 0.15, 0.06):
+        post(make(sy * frac, sx * frac, momentum=2))
+        _t.sleep(0.03)
+    post(make(0, 0, momentum=M_END))
+
+
 def call_tool(name: str, args: dict) -> dict:
     if name == "displays":
         rows = [{"display": s["index"] + 1, "main": bool(s.get("main")),
@@ -558,15 +631,19 @@ def call_tool(name: str, args: dict) -> dict:
         w = state.get("screenshot_width") or 400
         h = state.get("screenshot_height") or 800
         cx, cy = w / 2.0, h / 2.0
-        span = max(40.0, dist * min(w, h))
+        # El recorrido se mide sobre el eje del gesto: en vertical manda el alto
+        # (si no, en ventanas verticales el swipe queda demasiado corto y iOS lo ignora).
+        span = max(60.0, dist * (h if direction in ("up", "down") else w))
+        # En feeds (TikTok) el centro cae sobre el caption/links y puede abrir un
+        # enlace en vez de deslizar: el gesto vertical arranca abajo.
         if direction == "up":
-            frm, to = (cx, cy + span / 2), (cx, cy - span / 2)
+            frm, to = (cx, h * 0.80), (cx, h * 0.80 - span)
         elif direction == "down":
-            frm, to = (cx, cy - span / 2), (cx, cy + span / 2)
+            frm, to = (cx, h * 0.25), (cx, h * 0.25 + span)
         elif direction == "left":
-            frm, to = (cx + span / 2, cy), (cx - span / 2, cy)
+            frm, to = (cx + span / 2, h * 0.62), (cx - span / 2, h * 0.62)
         else:
-            frm, to = (cx - span / 2, cy), (cx + span / 2, cy)
+            frm, to = (cx - span / 2, h * 0.62), (cx + span / 2, h * 0.62)
         res = cua_call("drag", {"pid": pid, "window_id": wid,
                                 "from_x": frm[0], "from_y": frm[1],
                                 "to_x": to[0], "to_y": to[1],
@@ -578,6 +655,29 @@ def call_tool(name: str, args: dict) -> dict:
             "to": [round(to[0], 1), round(to[1], 1)],
             "duration_ms": dur, "delivery_mode": dm}
         return out
+
+    if name == "scroll_smooth":
+        wid = int((args or {}).get("window_id"))
+        pid = resolve_pid(wid)
+        if pid is None:
+            return {"content": [{"type": "text", "text":
+                                 "ERROR: no encuentro pid para window_id %s" % wid}], "isError": True}
+        direction = (args or {}).get("direction") or "down"
+        amount = int((args or {}).get("amount") or 400)
+        steps = int((args or {}).get("steps") or 14)
+        if direction == "down":
+            dy, dx = -amount, 0
+        elif direction == "up":
+            dy, dx = amount, 0
+        elif direction == "left":
+            dy, dx = 0, amount
+        else:
+            dy, dx = 0, -amount
+        smooth_scroll(pid, dy, dx, steps=steps)
+        info = {"window_id": wid, "pid": pid, "direction": direction,
+                "dy": dy, "dx": dx, "steps": steps}
+        return {"content": [{"type": "text", "text": json.dumps(info)}],
+                "structuredContent": info}
 
     route = ROUTES.get(name)
     if route is None:
