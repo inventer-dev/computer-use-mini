@@ -149,13 +149,30 @@ TOOLS = [
     ),
     tool(
         "scroll",
-        "Desplaza la ventana arriba/abajo.",
+        "Desplaza la ventana. Para gestos tipo swipe (feed vertical) usa `drag`.",
         {
             "window_id": WINDOW_ID,
             "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-            "amount": {"type": "integer", "description": "Ticks (default 5)"},
+            "amount": {"type": "integer", "description": "Unidades de scroll (default 3)"},
         },
         ["window_id", "direction"],
+    ),
+    tool(
+        "drag",
+        "Arrastre con presionar-mover-soltar entre dos puntos de la captura de la ventana. "
+        "Sirve para swipe (feed tipo TikTok), seleccionar texto, mover sliders o paneles.",
+        {
+            "window_id": WINDOW_ID,
+            "from_x": {"type": "number"},
+            "from_y": {"type": "number"},
+            "to_x": {"type": "number"},
+            "to_y": {"type": "number"},
+            "duration_ms": {"type": "integer", "description": "Duración del gesto (default 500)"},
+            "steps": {"type": "integer", "description": "Eventos intermedios (default 20)"},
+            "delivery_mode": {"type": "string", "enum": ["background", "foreground"]},
+            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+        },
+        ["window_id", "from_x", "from_y", "to_x", "to_y"],
     ),
     tool(
         "open_app",
@@ -202,6 +219,8 @@ ROUTES = {
     "type": ("type_text", {"window_id", "text", "element"}),
     "key": ("press_key", {"window_id", "key", "modifiers"}),
     "scroll": ("scroll", {"window_id", "direction", "amount"}),
+    "drag": ("drag", {"window_id", "from_x", "from_y", "to_x", "to_y", "duration_ms",
+                      "steps", "delivery_mode", "button", "modifier"}),
     "open_app": ("launch_app", {"name"}),
     "front": ("bring_to_front", {"window_id", "session"}),
     "guide": ("get_guide", {"topic"}),
@@ -499,7 +518,7 @@ def call_tool(name: str, args: dict) -> dict:
                                  "ERROR: nombre de app invalido"}], "isError": True}
 
     if "window_id" in payload and driver_tool in (
-        "get_window_state", "click", "type_text", "press_key", "scroll", "bring_to_front"
+        "get_window_state", "click", "type_text", "press_key", "scroll", "bring_to_front", "drag"
     ) and not payload.get("pid"):
         pid = resolve_pid(int(payload["window_id"]))
         if pid is None:
