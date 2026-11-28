@@ -159,16 +159,17 @@ TOOLS = [
     ),
     tool(
         "scroll_smooth",
-        "Scroll con fases de trackpad (el gesto de dos dedos). Es el que sí funciona en "
-        "iPhone Mirroring y feeds tipo TikTok; `scroll` manda rueda discreta y casi nunca avanza.",
+        "Scroll con fases de trackpad (gesto de dos dedos) dirigido al proceso. Mejor que `scroll` "
+        "en apps normales. OJO: en iPhone Mirroring NO hace avanzar el feed vertical de TikTok/Reels "
+        "— ahí solo funcionan los taps; el pager ignora scroll y arrastres sintéticos.",
         {
             "window_id": WINDOW_ID,
             "direction": {"type": "string", "enum": ["up", "down", "left", "right"],
-                          "description": "down = avanzar al siguiente elemento del feed"},
+                          "description": "down = avanzar hacia abajo"},
             "amount": {"type": "integer", "description": "Píxeles totales (default 400)"},
             "steps": {"type": "integer", "description": "Eventos intermedios (default 14)"},
         },
-        ["window_id", "direction"],
+        ["window_id"],
     ),
     tool(
         "drag",
